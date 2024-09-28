@@ -1,4 +1,4 @@
-name: eecv_2024
+name: eccv_2024
 channels:
   - pytorch
   - conda-forge

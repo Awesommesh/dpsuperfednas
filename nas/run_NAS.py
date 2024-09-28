@@ -22,7 +22,7 @@ parser.add_argument('--evo_ratio', metavar='R', help='The ratio of networks that
 args = parser.parse_args()
 
 target_hardware = args.target_hardware
-CKPT_PATH = '/nethome/sannavajjala6/projects/wsn/superfed_ckpt.pt'
+CKPT_PATH = ''
 
 batch_size = 64
 # hardware_latency = {'cpu' : [30, 35],
