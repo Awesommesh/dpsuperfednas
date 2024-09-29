@@ -1,5 +1,8 @@
 # SuperFedNAS – Cost-Efficient Federated Neural Architecture Search for On-Device Inference
-![](figures/SuperFedNAS-Intro.jpg)
+
+<p align="center">
+<img src="figures/SuperFedNAS-Intro.jpg"  width="80%" height="30%"> 
+</p>
 
 ### Accepted as a conference paper at ECCV 2024 [[ArXiv]](https://arxiv.org/abs/2301.10879)
 Note: This implementation is adopted from the source code of [FedML](https://github.com/FedML-AI/FedML)
@@ -14,21 +17,28 @@ As discussed in the paper, SuperFedNAS effectively solves two challenges faced b
 
 
 ## Better Accuracy than Existing Federated NAS Methods
-![](figures/SuperFedNASDatasetAblation.png)
+<p align="center">
+<img src="figures/SuperFedNASDatasetAblation.png"  width="70%" height="30%"> 
+</p>
 
 ## Produces Specialized DNNs for Target Deployments at less Cost
 
-![](figures/Comp_Cost_Graph.jpg)
+<p align="center">
+<img src="figures/Comp_Cost_Graph.jpg"  width="70%" height="30%"> 
+</p>
 
 ## SuperFedNAS's Specialized Architectures for Different Deployment Targets
 Below we present specialized DNNs found by SuperFedNAS’s search stage on different hardware/latency targets. 
 SuperFedNAS finds a more accurate DNN for RTX 2080Ti GPU (91.56%) compared to the AMD CPU (85.25%).
 It can be seen that SuperFedNAS’s specialized DNNs are shallow/thin for AMD CPU but wide/deep for GPU.
 The following image shows the extracted specialized ResNet DNN architecture extracted by SuperFedNAS during NAS on AMD CPU with a 112ms latency target.
-![](figures/NAS_Arch_Visualization_CPU_Model.jpg)
+<p align="center">
+<img src="figures/NAS_Arch_Visualization_CPU_Model.jpg"  width="40%" height="30%"> 
+</p>
 The following image shows the extracted specialized ResNet DNN architecture extracted by SuperFedNAS during NAS on Nvidia RTX 2080 Ti GPU with a 18.2ms latency target.
-![](figures/NAS_Arch_Visualization_GPU_Model.jpg)
-
+<p align="center">
+<img src="figures/NAS_Arch_Visualization_GPU_Model.jpg"  width="50%" height="30%"> 
+</p>
 ## Installation
 1. Clone repository
 2. Either activate conda environment using
