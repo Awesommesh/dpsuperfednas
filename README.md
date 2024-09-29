@@ -39,6 +39,7 @@ The following image shows the extracted specialized ResNet DNN architecture extr
 <p align="center">
 <img src="figures/NAS_Arch_Visualization_GPU_Model.jpg"  width="50%" height="30%"> 
 </p>
+
 ## Installation
 1. Clone repository
 2. Either activate conda environment using
