@@ -4,8 +4,9 @@ import logging
 import copy
 import wandb
 import torch
+import pickle
 from ofa.utils import flops_counter as fp
-
+import os
 
 """
 Notes:
@@ -54,6 +55,7 @@ class FLOFA_Trainer(ABC):
             test_data_local_dict,
             class_num,
         ] = dataset
+        self.client_data_distribution = train_data_local_num_dict
         self.train_global = train_data_global
         self.test_global = test_data_global
         self.train_data_num_in_total = train_data_num
@@ -61,6 +63,8 @@ class FLOFA_Trainer(ABC):
         self.train_data_local_num_dict = train_data_local_num_dict
         self.train_data_local_dict = train_data_local_dict
         self.test_data_local_dict = test_data_local_dict
+
+        self.all_weight_updates = []
 
         self.args = args
         self.start_round = start_round
@@ -194,6 +198,12 @@ class FLOFA_Trainer(ABC):
                 self.best_model_interval += self.args.best_model_freq
                 self.prev_best = 0.0
             self.train_one_round(round_idx)
+        original_path = f'~/superfed/superfednas/dlm/weight_updates/all_weight_updates.pkl'
+        expanded_path = os.path.expanduser(original_path)
+        ground_truth_dir = os.path.dirname(expanded_path)
+        os.makedirs(ground_truth_dir, exist_ok=True)
+        with open(expanded_path, 'wb') as f:
+            pickle.dump(self.all_weight_updates, f)
         if self.args.dry_run:
             return
         if self.args.wandb_watch:
@@ -214,7 +224,7 @@ class FLOFA_Trainer(ABC):
         avg_gflops = 0
         avg_params = 0
         training_samples = []
-
+        self.weight_update = []
         for idx in range(self.args.client_num_per_round):
             # update dataset
             client_idx = client_indexes[idx]
@@ -279,8 +289,24 @@ class FLOFA_Trainer(ABC):
                     f" LR: {cur_lr}"
                     f" Counts: {self.server_model.cli_subnet_track[client_idx]}"
                 )
-
+            
             updated_cli_model = self.client_trainer.train(cur_lr, local_ep)
+            client_update = {
+                'client_id': client_idx,
+                'round': round_num,
+                'weight_update': updated_cli_model.state_dict()
+            }
+            #TO DO
+            ''' if client_model.model_config == the smallest subnet:
+                client_update['is_smallest'] = True
+                if client_model.model_config == the largest subnet:
+                    client_update['is_largest'] = True
+                
+            '''
+            original_data, original_label = self.client_trainer.local_training_data, self.client_trainer.local_test_data
+            self.save_ground_truth(original_data, original_label, round_num, client_idx)
+            self.weight_update.append(client_update)
+            self.all_weight_updates.append(client_update)
             training_samples.append(self.client_trainer.get_sample_number())
             # Update client state
             if self.feddyn:
@@ -381,6 +407,14 @@ class FLOFA_Trainer(ABC):
                 self.args.ofa_config,
                 self.args.model,
             )
+
+        original_path = f'~/superfed/superfednas/dlm/weight_updates/weight_updates_round_{round_num}.pkl'
+        expanded_path = os.path.expanduser(original_path)
+        ground_truth_dir = os.path.dirname(expanded_path)
+        os.makedirs(ground_truth_dir, exist_ok=True)
+
+        # with open(expanded_path, 'wb') as f:
+        #     pickle.dump(self.weight_update, f)
 
     def _local_test_on_all_clients(self, round_idx):
 
@@ -1093,3 +1127,23 @@ class FLOFA_Trainer(ABC):
             self.server_model.get_server_state().parameters(), model_delta.parameters(),
         ):
             state_param.data -= self.feddyn_alpha * delta_param
+
+    def save_ground_truth(self, data, label, round_num, client_id):
+        """
+        Save the ground truth data and label to a .pt file.
+        
+        Args:
+            data (torch.Tensor): Image tensor of shape [1, 3, 32, 32].
+            label (int): Integer label corresponding to the image.
+            round_num (int): Current round number.
+            client_id (int): Identifier of the client.
+        """
+        original_path = f'~/superfed/superfednas/dlm/ground_truths/ground_truth_round_{round_num}_client_{client_id}.pkl'
+        expanded_path = os.path.expanduser(original_path)        
+        ground_truth_dir = os.path.dirname(expanded_path)
+        os.makedirs(ground_truth_dir, exist_ok=True)
+        
+        torch.save({'data': data, 'label': label}, expanded_path)
+        logging.info(f"Saved ground truth to '{expanded_path}'.")
+
+
