@@ -4,8 +4,9 @@ import logging
 import copy
 import wandb
 import torch
+import pickle
 from ofa.utils import flops_counter as fp
-
+import os
 
 """
 Notes:
@@ -54,6 +55,7 @@ class FLOFA_Trainer(ABC):
             test_data_local_dict,
             class_num,
         ] = dataset
+        self.client_data_distribution = train_data_local_num_dict
         self.train_global = train_data_global
         self.test_global = test_data_global
         self.train_data_num_in_total = train_data_num
@@ -61,6 +63,10 @@ class FLOFA_Trainer(ABC):
         self.train_data_local_num_dict = train_data_local_num_dict
         self.train_data_local_dict = train_data_local_dict
         self.test_data_local_dict = test_data_local_dict
+
+        self.model_checkpoint_paths = {}
+        self.weight_updates_dir = os.path.expanduser('~/superfed/superfednas/dlm/weight_updates')
+        os.makedirs(self.weight_updates_dir, exist_ok=True)
 
         self.args = args
         self.start_round = start_round
@@ -194,6 +200,12 @@ class FLOFA_Trainer(ABC):
                 self.best_model_interval += self.args.best_model_freq
                 self.prev_best = 0.0
             self.train_one_round(round_idx)
+
+        paths_file = os.path.join(self.weight_updates_dir, 'model_paths.pkl')
+        with open(paths_file, 'wb') as f:
+            pickle.dump(self.model_checkpoint_paths, f)
+        
+        logging.info(f"Saved model paths to '{paths_file}'")
         if self.args.dry_run:
             return
         if self.args.wandb_watch:
@@ -214,7 +226,7 @@ class FLOFA_Trainer(ABC):
         avg_gflops = 0
         avg_params = 0
         training_samples = []
-
+        self.weight_update = []
         for idx in range(self.args.client_num_per_round):
             # update dataset
             client_idx = client_indexes[idx]
@@ -279,8 +291,18 @@ class FLOFA_Trainer(ABC):
                     f" LR: {cur_lr}"
                     f" Counts: {self.server_model.cli_subnet_track[client_idx]}"
                 )
-
+            
             updated_cli_model = self.client_trainer.train(cur_lr, local_ep)
+            client_update = {
+                'client_id': client_idx,
+                'round': round_num,
+                'weight_update': updated_cli_model.state_dict(),
+                'is_smallest': False
+            }
+            if self.server_model.is_min_net(client_model.model_config):
+                client_update["is_smallest"] = True
+
+                
             training_samples.append(self.client_trainer.get_sample_number())
             # Update client state
             if self.feddyn:
@@ -381,6 +403,15 @@ class FLOFA_Trainer(ABC):
                 self.args.ofa_config,
                 self.args.model,
             )
+        if client_update['is_smallest']:
+            checkpoint_filename = f"weight_updates_round_{round_num}.pkl"
+            checkpoint_path = os.path.join(self.weight_updates_dir, checkpoint_filename)
+            with open(checkpoint_path, 'wb') as f:
+                pickle.dump(self.weight_update, f)
+            logging.info(f"Saved weight updates for round {round_num} at {checkpoint_path}")
+
+            self.model_checkpoint_paths[round_num] = checkpoint_path
+
 
     def _local_test_on_all_clients(self, round_idx):
 
@@ -1093,3 +1124,7 @@ class FLOFA_Trainer(ABC):
             self.server_model.get_server_state().parameters(), model_delta.parameters(),
         ):
             state_param.data -= self.feddyn_alpha * delta_param
+
+
+
+

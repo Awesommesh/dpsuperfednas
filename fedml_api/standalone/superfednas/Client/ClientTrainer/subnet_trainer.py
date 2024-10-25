@@ -7,7 +7,7 @@ import torch
 import logging
 from torch import nn
 import torch.nn.functional as F
-
+from .dp_utils import compute_epsilon
 
 class SubnetTrainer(ClientTrainer):
     def __init__(self, model, device, args, teacher_model=None):
@@ -58,11 +58,88 @@ class SubnetTrainer(ClientTrainer):
             optimizer = torch.optim.Adam(
                 model_params, lr=lr, weight_decay=cur_wd, amsgrad=True,
             )
-
+        
+        if self.args.use_dp:
+            max_grad_norm = self.args.dp_clip_norm  # Clipping threshold
+            noise_multiplier = self.args.dp_noise_multiplier  # Noise multiplier
+            delta = self.args.dp_delta
+            batch_size=64
+        
+            sample_rate = self.args.batch_size / len(self.local_training_data.dataset)
+            steps = 0  # Initialize the number of steps
+            orders = [1 + x / 10.0 for x in range(1, 100)]
+            
+        print(f"Number of batches: {len(self.local_training_data)}")
         epoch_loss = []
         for epoch in range(local_ep if local_ep is not None else self.args.epochs):
             batch_loss = []
-            if self.args.dataset == 'ptb':
+            if self.args.use_dp:
+                for batch_idx, (x, labels) in enumerate(self.local_training_data):
+                    if batch_idx == 20:
+                        break
+                    x, labels = x.to(self.device), labels.to(self.device)
+                    optimizer.zero_grad()
+
+                    batch_size = x.size(0)
+                    per_sample_grads = [
+                        torch.zeros((batch_size, *param.shape), device=param.device)
+                        for param in model_params
+                    ]
+
+                    for i in range(x.size(0)):
+                        for param in model_params:
+                            if param.grad is not None:
+                                param.grad.detach_()
+                                param.grad.zero_()
+                        optimizer.zero_grad()
+
+                        xi = x[i].unsqueeze(0)
+                        label_i = labels[i].unsqueeze(0)
+                        output_i = self.client_model.forward(xi)
+                        if self.args.model == "darts":
+                            output_i = output_i[0]
+                        loss_i = criterion(output_i, label_i)
+
+                        loss_i.backward()
+
+                        for idx, param in enumerate(model_params):
+                            if param.grad is not None:
+                                per_sample_grads[idx][i] = param.grad.detach().clone()
+                        
+                    grad_norms = torch.zeros(x.size(0), device=self.device)
+                    for grad in per_sample_grads:
+                        grad_norms += grad.view(x.size(0), -1).norm(2, dim=1) ** 2
+                    grad_norms = grad_norms.sqrt()
+
+                    clip_coeffs = (max_grad_norm / (grad_norms + 1e-6)).clamp(max=1.0)
+
+                    for idx in range(len(per_sample_grads)):
+                        per_sample_grads[idx] = per_sample_grads[idx].mul(clip_coeffs.view(-1, 1))
+
+                    aggregated_grads = []
+                    for grad in per_sample_grads:
+                        aggregated_grad = grad.sum(dim=0)
+                        aggregated_grads.append(aggregated_grad)
+                    for idx, param in enumerate(model_params):
+                        noise = torch.normal(
+                            mean=0.0,
+                            std=noise_multiplier * max_grad_norm,
+                            size=aggregated_grads[idx].shape,
+                            device=self.device,
+                        )
+                        aggregated_grads[idx].add_(noise)
+                        param.grad = aggregated_grads[idx] / batch_size
+
+                    optimizer.step()
+
+                    outputs = self.client_model.forward(x)
+                    if self.args.model == "darts":
+                        outputs = outputs[0]
+                    loss = criterion(outputs, labels)
+                    batch_loss.append(loss.item())
+                    steps+=1
+                    print(f"Batch: {batch_idx}")
+            elif self.args.dataset == 'ptb':
                 for batch_idx, i in enumerate(range(0, self.local_training_data.size(1) - 1, self.args.validseqlen)):
                     if i + self.args.seq_len - self.args.validseqlen >= self.local_training_data.size(1) - 1:
                         continue
@@ -71,7 +148,6 @@ class SubnetTrainer(ClientTrainer):
                     optimizer.zero_grad()
                     output = self.client_model.forward(data)
 
-                    # Discard the effective history part
                     eff_history = self.args.seq_len - self.args.validseqlen
                     if eff_history < 0:
                         raise ValueError("Valid sequence length must be smaller than sequence length!")
@@ -137,13 +213,16 @@ class SubnetTrainer(ClientTrainer):
 
                     batch_loss.append(loss.item())
             epoch_loss.append(sum(batch_loss) / len(batch_loss))
-
+            if self.args.use_dp:
+                epsilon = compute_epsilon(steps, sample_rate, noise_multiplier, delta)
             if self.args.verbose:
                 logging.info(
                     "Client Index = {}\tEpoch: {}\tLoss: {:.6f}".format(
                         self.client_idx, epoch, sum(epoch_loss) / len(epoch_loss),
                     )
                 )
+                if self.args.use_dp:
+                    logging.info(f"Privacy budget after {steps} steps: ε = {epsilon:.2f}, δ = {delta}")
         if not self.args.use_bn:
             for m in self.client_model.modules():
                 if isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):

@@ -8,6 +8,31 @@ def add_args(parser):
     """
     # Training settings
     parser.add_argument(
+        "--use_dp",
+        action="store_true",
+        help="Enable Differential Privacy during training"
+    )
+    parser.add_argument(
+        "--dp_clip_norm",
+        type=float,
+        default=1.0,
+        help="Clipping threshold for DP-SGD gradients (default: 1.0)"
+    )
+    
+    parser.add_argument(
+        "--dp_noise_multiplier",
+        type=float,
+        default=1.1,
+        help="Noise multiplier for DP-SGD (default: 1.1)"
+    )
+    
+    parser.add_argument(
+        "--dp_delta",
+        type=float,
+        default=1e-5,
+        help="Delta parameter for differential privacy (default: 1e-5)"
+    )
+    parser.add_argument(
         "--model",
         type=str,
         default="resnet56",
