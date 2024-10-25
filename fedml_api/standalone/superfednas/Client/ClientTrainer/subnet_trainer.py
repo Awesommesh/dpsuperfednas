@@ -8,6 +8,7 @@ import logging
 from torch import nn
 import torch.nn.functional as F
 from .dp_utils import compute_epsilon
+from opacus import PrivacyEngine
 
 class SubnetTrainer(ClientTrainer):
     def __init__(self, model, device, args, teacher_model=None):
@@ -47,11 +48,14 @@ class SubnetTrainer(ClientTrainer):
             and self.args.largest_subnet_wd
         ):
             cur_wd = self.args.largest_subnet_wd
-
+        # for name, param in self.client_model.model.named_parameters():
+        #     print(f"Parameter Name: {name}, Requires Grad: {param.requires_grad}, Shape: {param.shape}")
+        # for param in self.client_model.parameters():
+        #     param.requires_grad = True
         if self.args.mod_wd_dyn:
             cur_wd += self.alpha
-        model_params = filter(lambda p: p.requires_grad, self.client_model.parameters())
-
+            
+        model_params = filter(lambda p: p.requires_grad, self.client_model.model.parameters())
         if self.args.client_optimizer == "sgd":
             optimizer = torch.optim.SGD(model_params, lr=lr, weight_decay=cur_wd,)
         else:
@@ -59,27 +63,82 @@ class SubnetTrainer(ClientTrainer):
                 model_params, lr=lr, weight_decay=cur_wd, amsgrad=True,
             )
         
+        model_params_list = list(model_params)
+        for idx, param in enumerate(model_params_list):
+            print(f"Parameter {idx} shape: {param.shape}")
+            print(f"Parameter {idx} name: {param}")
+            
+        if self.args.use_opacus_dp:
+            max_grad_norm = self.args.dp_clip_norm
+            noise_multiplier = self.args.dp_noise_multiplier
+            delta = self.args.dp_delta
+            sample_rate = self.args.batch_size / len(self.local_training_data.dataset)
+            
+            privacy_engine = PrivacyEngine()
+            self.client_model, optimizer, self.local_training_data = privacy_engine.make_private(
+                module=self.client_model,
+                noise_multiplier=noise_multiplier,
+                max_grad_norm=max_grad_norm,
+                optimizer=optimizer,
+                data_loader=self.local_training_data
+            )
+            # privacy_engine = PrivacyEngine(
+            #     self.client_model,
+            #     noise_multiplier=noise_multiplier,
+            #     max_grad_norm=max_grad_norm,
+            # )
+            # privacy_engine.attach(optimizer)
         if self.args.use_dp:
-            max_grad_norm = self.args.dp_clip_norm  # Clipping threshold
-            noise_multiplier = self.args.dp_noise_multiplier  # Noise multiplier
+            max_grad_norm = self.args.dp_clip_norm
+            noise_multiplier = self.args.dp_noise_multiplier
             delta = self.args.dp_delta
             batch_size=64
         
             sample_rate = self.args.batch_size / len(self.local_training_data.dataset)
-            steps = 0  # Initialize the number of steps
+            steps = 0
             orders = [1 + x / 10.0 for x in range(1, 100)]
             
         print(f"Number of batches: {len(self.local_training_data)}")
         epoch_loss = []
         for epoch in range(local_ep if local_ep is not None else self.args.epochs):
             batch_loss = []
-            if self.args.use_dp:
+            # Opacus test implementation
+            if self.args.use_opacus_dp:
                 for batch_idx, (x, labels) in enumerate(self.local_training_data):
-                    if batch_idx == 20:
-                        break
                     x, labels = x.to(self.device), labels.to(self.device)
                     optimizer.zero_grad()
+                    # if x.ndim == 3:
+                    #     x = x.unsqueeze(1)
+                    #     x = x.repeat(1, 3, 1, 1)
+                    log_probs = self.client_model.forward(x)
+                    if self.args.model == "darts":
+                        log_probs = log_probs[0]
+                    if self.args.kd_ratio > 0:
+                        with torch.no_grad():
+                            soft_logits = self.teacher_model.forward(x).detach()
+                            soft_label = F.softmax(soft_logits, dim=1)
+                    if self.args.kd_ratio == 0:
+                        loss = criterion(log_probs, labels)
+                    else:
+                        if self.args.kd_type == "ce":
+                            kd_loss = self.cross_entropy_loss_with_soft_target(
+                                log_probs, soft_label
+                            )
+                        else:
+                            kd_loss = F.mse_loss(log_probs, soft_logits)
+                        loss = self.args.kd_ratio * kd_loss + (
+                            1 - self.args.kd_ratio
+                        ) * criterion(log_probs, labels)
+                    loss.backward()
+                    optimizer.step()
 
+                    batch_loss.append(loss.item())
+            # dp-sgd impl. w/ per-sample
+            elif self.args.use_dp:
+                for batch_idx, (x, labels) in enumerate(self.local_training_data):
+                    x, labels = x.to(self.device), labels.to(self.device)
+                    optimizer.zero_grad()
+                    print(f"Batch size: {x.size()}")
                     batch_size = x.size(0)
                     per_sample_grads = [
                         torch.zeros((batch_size, *param.shape), device=param.device)
@@ -94,6 +153,7 @@ class SubnetTrainer(ClientTrainer):
                         optimizer.zero_grad()
 
                         xi = x[i].unsqueeze(0)
+                        # print(f"xi: {xi.size()}")
                         label_i = labels[i].unsqueeze(0)
                         output_i = self.client_model.forward(xi)
                         if self.args.model == "darts":
@@ -101,8 +161,10 @@ class SubnetTrainer(ClientTrainer):
                         loss_i = criterion(output_i, label_i)
 
                         loss_i.backward()
-
+                        # Convert model_params from a filter object to a list   
+                            
                         for idx, param in enumerate(model_params):
+                            print("get here")
                             if param.grad is not None:
                                 per_sample_grads[idx][i] = param.grad.detach().clone()
                         
@@ -112,14 +174,19 @@ class SubnetTrainer(ClientTrainer):
                     grad_norms = grad_norms.sqrt()
 
                     clip_coeffs = (max_grad_norm / (grad_norms + 1e-6)).clamp(max=1.0)
+                    print(f"clip_coeffs: {clip_coeffs}")
 
                     for idx in range(len(per_sample_grads)):
                         per_sample_grads[idx] = per_sample_grads[idx].mul(clip_coeffs.view(-1, 1))
+                    print(f"Per_sample_grads: {len(per_sample_grads)}")
+                    print(f"Per_sample_grads[0]: {per_sample_grads[0].size()}")
 
                     aggregated_grads = []
                     for grad in per_sample_grads:
                         aggregated_grad = grad.sum(dim=0)
                         aggregated_grads.append(aggregated_grad)
+                        print(f"grad: {grad.size()}")
+                    print(len(aggregated_grads))
                     for idx, param in enumerate(model_params):
                         noise = torch.normal(
                             mean=0.0,
@@ -166,10 +233,9 @@ class SubnetTrainer(ClientTrainer):
                     optimizer.zero_grad()
                     output = self.client_model.forward(data)
 
-                    # Discard the effective history part
                     eff_history = data.size(1)-1
                     if eff_history < 0:
-                        raise ValueError("Valid sequence length must be smaller than sequence length!")
+                        raise ValueError("Valid sequence length must be smaller than sequence length")
                     final_target = targets[:, eff_history:].contiguous().view(-1)
                     final_output = output[:, eff_history:].contiguous().view(-1, self.args.n_chars)
                     loss = criterion(final_output, final_target)
@@ -215,6 +281,8 @@ class SubnetTrainer(ClientTrainer):
             epoch_loss.append(sum(batch_loss) / len(batch_loss))
             if self.args.use_dp:
                 epsilon = compute_epsilon(steps, sample_rate, noise_multiplier, delta)
+            if self.args.use_opacus_dp:
+                epsilon, best_alpha = privacy_engine.get_privacy_spent(delta)
             if self.args.verbose:
                 logging.info(
                     "Client Index = {}\tEpoch: {}\tLoss: {:.6f}".format(
@@ -223,6 +291,10 @@ class SubnetTrainer(ClientTrainer):
                 )
                 if self.args.use_dp:
                     logging.info(f"Privacy budget after {steps} steps: ε = {epsilon:.2f}, δ = {delta}")
+                if self.args.use_opacus_dp:
+                    logging.info(
+                        f"(ε = {epsilon:.2f}, δ = {delta}) for α = {best_alpha}"
+                    )
         if not self.args.use_bn:
             for m in self.client_model.modules():
                 if isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
@@ -243,6 +315,8 @@ class SubnetTrainer(ClientTrainer):
                             m.running_var.equal(torch.ones_like(m.running_var)),
                             "BN running var param not all 1s",
                         )
+        if self.args.use_opacus_dp:
+            privacy_engine.detach()
         return self.client_model
 
     def test(self, dataset, args, **kwargs):
