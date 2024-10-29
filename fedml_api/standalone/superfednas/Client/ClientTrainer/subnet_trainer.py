@@ -54,8 +54,9 @@ class SubnetTrainer(ClientTrainer):
         #     param.requires_grad = True
         if self.args.mod_wd_dyn:
             cur_wd += self.alpha
-            
-        model_params = filter(lambda p: p.requires_grad, self.client_model.model.parameters())
+        # print(f"client_mdoel: {self.client_model}")
+        # print(f"client_model.model: {self.client_model.model}")
+        model_params = list(filter(lambda p: p.requires_grad, self.client_model.model.parameters()))
         if self.args.client_optimizer == "sgd":
             optimizer = torch.optim.SGD(model_params, lr=lr, weight_decay=cur_wd,)
         else:
@@ -63,10 +64,10 @@ class SubnetTrainer(ClientTrainer):
                 model_params, lr=lr, weight_decay=cur_wd, amsgrad=True,
             )
         
-        model_params_list = list(model_params)
-        for idx, param in enumerate(model_params_list):
-            print(f"Parameter {idx} shape: {param.shape}")
-            print(f"Parameter {idx} name: {param}")
+        # filter object gets exhausted
+        # for p in model_params:
+        #     print(p)
+        # print(model_params[0])
             
         if self.args.use_opacus_dp:
             max_grad_norm = self.args.dp_clip_norm
@@ -88,6 +89,10 @@ class SubnetTrainer(ClientTrainer):
             #     max_grad_norm=max_grad_norm,
             # )
             # privacy_engine.attach(optimizer)
+        # print(len(self.local_training_data))
+        # print(len(self.local_training_data.dataset))
+        
+        # dp-sgd args
         if self.args.use_dp:
             max_grad_norm = self.args.dp_clip_norm
             noise_multiplier = self.args.dp_noise_multiplier
@@ -98,7 +103,7 @@ class SubnetTrainer(ClientTrainer):
             steps = 0
             orders = [1 + x / 10.0 for x in range(1, 100)]
             
-        print(f"Number of batches: {len(self.local_training_data)}")
+        # print(f"Number of batches: {len(self.local_training_data)}")
         epoch_loss = []
         for epoch in range(local_ep if local_ep is not None else self.args.epochs):
             batch_loss = []
@@ -107,9 +112,6 @@ class SubnetTrainer(ClientTrainer):
                 for batch_idx, (x, labels) in enumerate(self.local_training_data):
                     x, labels = x.to(self.device), labels.to(self.device)
                     optimizer.zero_grad()
-                    # if x.ndim == 3:
-                    #     x = x.unsqueeze(1)
-                    #     x = x.repeat(1, 3, 1, 1)
                     log_probs = self.client_model.forward(x)
                     if self.args.model == "darts":
                         log_probs = log_probs[0]
@@ -138,55 +140,75 @@ class SubnetTrainer(ClientTrainer):
                 for batch_idx, (x, labels) in enumerate(self.local_training_data):
                     x, labels = x.to(self.device), labels.to(self.device)
                     optimizer.zero_grad()
-                    print(f"Batch size: {x.size()}")
+                    # print(f"Batch size: {x.size()}")
+                    # print(f"Label size: {labels.size()}")
                     batch_size = x.size(0)
                     per_sample_grads = [
                         torch.zeros((batch_size, *param.shape), device=param.device)
                         for param in model_params
                     ]
+                    
+                    # print(f"second-last: {per_sample_grads[-2].size()}")
+                    # print(f"last: {per_sample_grads[-1].size()}")
+                    # print(f"Length of per_sample_grads: {len(per_sample_grads)}")
+                    # print(f"Dims of per_sample_grads[0]: {per_sample_grads[0].size()}")
+                    # print(f"Length of model_params: {len(model_params)}")
+                    # print(f"np.array: {np.array(model_params).shape}")
 
                     for i in range(x.size(0)):
                         for param in model_params:
+                            # print(f"Here is a param: {type(param)}")
                             if param.grad is not None:
+                                # print(type(param[0]))
                                 param.grad.detach_()
                                 param.grad.zero_()
                         optimizer.zero_grad()
 
                         xi = x[i].unsqueeze(0)
-                        # print(f"xi: {xi.size()}")
                         label_i = labels[i].unsqueeze(0)
+                        # print(f"label_i: {label_i}")
                         output_i = self.client_model.forward(xi)
+                        # print(output_i.size())
                         if self.args.model == "darts":
                             output_i = output_i[0]
                         loss_i = criterion(output_i, label_i)
 
                         loss_i.backward()
-                        # Convert model_params from a filter object to a list   
                             
                         for idx, param in enumerate(model_params):
-                            print("get here")
                             if param.grad is not None:
                                 per_sample_grads[idx][i] = param.grad.detach().clone()
-                        
+                    # print(f"Per sample grads: {per_sample_grads}")
                     grad_norms = torch.zeros(x.size(0), device=self.device)
                     for grad in per_sample_grads:
+                        # grad is 64 x 3 x 3 x 3
+                        temp = grad.view(x.size(0), -1).norm(2, dim=1) ** 2
+                        # print(f"Here is a shape {temp.shape}")
                         grad_norms += grad.view(x.size(0), -1).norm(2, dim=1) ** 2
                     grad_norms = grad_norms.sqrt()
 
                     clip_coeffs = (max_grad_norm / (grad_norms + 1e-6)).clamp(max=1.0)
-                    print(f"clip_coeffs: {clip_coeffs}")
-
+                    # print(f"clip_coeffs: {clip_coeffs}")
+                    
+                    # good up to here
+                    # theres an issue with .mul here
                     for idx in range(len(per_sample_grads)):
-                        per_sample_grads[idx] = per_sample_grads[idx].mul(clip_coeffs.view(-1, 1))
-                    print(f"Per_sample_grads: {len(per_sample_grads)}")
-                    print(f"Per_sample_grads[0]: {per_sample_grads[0].size()}")
+                        # print(f"per_sample_grads[idx]: {per_sample_grads[idx].size()}")
+                        # print(f"clip_coeffs: {clip_coeffs.view(-1, 1).size()}")
+                        new_shape = [1] * len(per_sample_grads[idx].shape)
+                        new_shape[0] = -1
+                        per_sample_grads[idx] = per_sample_grads[idx].mul(clip_coeffs.view(*new_shape))
+                    # print(f"Per_sample_grads: {len(per_sample_grads)}")
+                    # print(f"Per_sample_grads[0]: {per_sample_grads[0].size()}")
 
                     aggregated_grads = []
                     for grad in per_sample_grads:
+                        # print(f'grad: {grad.size()}')
                         aggregated_grad = grad.sum(dim=0)
+                        # print(f'agg_grad: {aggregated_grad.size()}')
                         aggregated_grads.append(aggregated_grad)
-                        print(f"grad: {grad.size()}")
-                    print(len(aggregated_grads))
+                        # print(f"grad: {grad.size()}")
+                    # print(len(aggregated_grads))
                     for idx, param in enumerate(model_params):
                         noise = torch.normal(
                             mean=0.0,
@@ -195,7 +217,11 @@ class SubnetTrainer(ClientTrainer):
                             device=self.device,
                         )
                         aggregated_grads[idx].add_(noise)
+                        # print(f"aggregated_grads: {aggregated_grads[idx].size()}")
+                        # print(f"param.grad: {param.grad.size()}")
+                        # batch_size = aggregated_grads[idx].size(0)
                         param.grad = aggregated_grads[idx] / batch_size
+                        # test = aggregated_grads[idx] / batch_size
 
                     optimizer.step()
 
@@ -205,7 +231,7 @@ class SubnetTrainer(ClientTrainer):
                     loss = criterion(outputs, labels)
                     batch_loss.append(loss.item())
                     steps+=1
-                    print(f"Batch: {batch_idx}")
+                    # print(f"Batch: {batch_idx}")
             elif self.args.dataset == 'ptb':
                 for batch_idx, i in enumerate(range(0, self.local_training_data.size(1) - 1, self.args.validseqlen)):
                     if i + self.args.seq_len - self.args.validseqlen >= self.local_training_data.size(1) - 1:

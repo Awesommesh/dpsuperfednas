@@ -12,6 +12,12 @@ def add_args(parser):
         action="store_true",
         help="Enable Differential Privacy during training"
     )
+    
+    parser.add_argument(
+        "--use_opacus_dp",
+        action="store_true",
+        help="Enable Opacus-based Differential Privacy during training"
+    )
     parser.add_argument(
         "--dp_clip_norm",
         type=float,
