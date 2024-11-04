@@ -7,8 +7,9 @@ import torch
 import logging
 from torch import nn
 import torch.nn.functional as F
-from .dp_utils import compute_epsilon
 from opacus import PrivacyEngine
+from opacus.accountants import RDPAccountant
+
 
 class SubnetTrainer(ClientTrainer):
     def __init__(self, model, device, args, teacher_model=None):
@@ -85,6 +86,9 @@ class SubnetTrainer(ClientTrainer):
             sample_rate = self.args.batch_size / len(self.local_training_data.dataset)
             steps = 0
             orders = [1 + x / 10.0 for x in range(1, 100)]
+            accountant = RDPAccountant()
+            
+            
             
         # print(f"Number of batches: {len(self.local_training_data)}")
         epoch_loss = []
@@ -209,6 +213,7 @@ class SubnetTrainer(ClientTrainer):
                         loss = criterion(outputs, labels)
                         batch_loss.append(loss.item())
                         steps+=1
+                        accountant.step(noise_multiplier=noise_multiplier, sample_rate=sample_rate)
             elif self.args.dataset == 'ptb':
                 for batch_idx, i in enumerate(range(0, self.local_training_data.size(1) - 1, self.args.validseqlen)):
                     if i + self.args.seq_len - self.args.validseqlen >= self.local_training_data.size(1) - 1:
@@ -283,7 +288,7 @@ class SubnetTrainer(ClientTrainer):
                     batch_loss.append(loss.item())
             epoch_loss.append(sum(batch_loss) / len(batch_loss))
             if self.args.use_dp:
-                epsilon = compute_epsilon(steps, sample_rate, noise_multiplier, delta)
+                epsilon = accountant.get_epsilon(delta)
             if self.args.use_opacus_dp:
                 epsilon, best_alpha = privacy_engine.get_privacy_spent(delta)
             if self.args.verbose:
@@ -293,7 +298,7 @@ class SubnetTrainer(ClientTrainer):
                     )
                 )
                 if self.args.use_dp:
-                    logging.info(f"Privacy budget after {steps} steps: ε = {epsilon:.2f}, δ = {delta}")
+                    logging.info(f"Privacy budget: ε = {epsilon:.2f}, δ = {delta}")
                 if self.args.use_opacus_dp:
                     logging.info(
                         f"(ε = {epsilon:.2f}, δ = {delta}) for α = {best_alpha}"
