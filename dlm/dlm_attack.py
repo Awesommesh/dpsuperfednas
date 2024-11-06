@@ -656,7 +656,7 @@ def dlm_attack(pickle_path, ground_truth_dir, output_dir, num_steps=1000, lr=1.0
         try:
             recovered_data, recovered_label, loss_history, psnr_history = dlm_attacker.reconstruct_input(
                 normalized_target_grads=normalized_target_grads,
-                num_steps=num_steps  # Example PSNR threshold for early stopping
+                num_steps=num_steps  
             )
         except Exception as e:
             logging.error(f"Error during reconstruction for Checkpoint Pair {round_num_prev} -> {round_num_curr}: {e}")
