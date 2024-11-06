@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-# dlm_attack_refactored.py
+# dlm_attack_refactored_lbfgs_fixed.py
 
 import argparse
 import os
 import pickle
 import logging
+import copy  # Added for deepcopy in metrics computation
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F  # Added for softmax
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
@@ -61,10 +63,9 @@ def load_ground_truth_images(ground_truth_dir, target_label=None):
     for filename in os.listdir(ground_truth_dir):
         if not filename.endswith('.png'):
             continue 
-        
+    
         filepath = os.path.join(ground_truth_dir, filename)
         
-
         try:
             label_str = filename.split('_')[-1]  # e.g., 'label3.png'
             label = int(label_str.replace('label', '').replace('.png', ''))
@@ -201,7 +202,7 @@ def find_closest_image(recovered_image, ground_truth_dict, metric_fn, same_class
             closest_image = gt_image
     
     if closest_image is None:
-        logging.warning(f"No valid closest image found for label {target_label}.")
+        logging.warning(f"No closest image found for label {target_label}.")
     
     return closest_label, closest_image, best_score
 
@@ -217,58 +218,145 @@ def find_closest_image_same_class(recovered_image, ground_truth_dict, metric_fn,
 
 
 def visualize_recovered_data(recovered_image, ground_truth_image, closest_image_same_class, save_path=None):
+    """
+    Visualizes the ground truth image, the reconstructed image, and optionally the closest same-class image.
+    
+    Args:
+        recovered_image (torch.Tensor): The reconstructed image tensor.
+        ground_truth_image (torch.Tensor): The ground truth image tensor.
+        closest_image_same_class (torch.Tensor or None): The closest same-class image tensor or None.
+        save_path (str, optional): Path to save the visualization image. If None, displays the plot.
+    """
 
-    recovered_np = recovered_image.squeeze().detach().cpu().numpy()
-    ground_truth_np = ground_truth_image.squeeze().detach().cpu().numpy()
+    # Verify that recovered_image and ground_truth_image are not None
+    if recovered_image is None or ground_truth_image is None:
+        logging.error("recovered_image or ground_truth_image is None.")
+        raise ValueError("recovered_image and ground_truth_image must be valid tensors.")
     
-    # Initialize closest_same_np to None
-    closest_same_np = None
+    # Process Recovered Image
+    recovered_np = recovered_image.detach().cpu().numpy()
+    logging.debug(f"Original recovered_image shape: {recovered_np.shape}")
     
-    if closest_image_same_class is not None:
-        closest_same_np = closest_image_same_class.squeeze().detach().cpu().numpy()
+    # Remove batch dimension if present
+    if recovered_np.ndim == 4 and recovered_np.shape[0] == 1:
+        recovered_np = recovered_np.squeeze(0)
+        logging.debug(f"Squeezed recovered_image shape: {recovered_np.shape}")
+    elif recovered_np.ndim == 3 and recovered_np.shape[0] == 1:
+        recovered_np = recovered_np.squeeze(0)
+        logging.debug(f"Squeezed recovered_image shape: {recovered_np.shape}")
     
-        # Transpose if necessary
-        if recovered_np.ndim == 3 and recovered_np.shape[0] == 3:
-            recovered_np = np.transpose(recovered_np, (1, 2, 0))  # [H, W, C]
-        if ground_truth_np.ndim == 3 and ground_truth_np.shape[0] == 3:
-            ground_truth_np = np.transpose(ground_truth_np, (1, 2, 0))  # [H, W, C]
-        if closest_same_np.ndim == 3 and closest_same_np.shape[0] == 3:
-            closest_same_np = np.transpose(closest_same_np, (1, 2, 0))  # [H, W, C]
-        
-        # Clip values to [0,1] for display
-        closest_same_np = np.clip(closest_same_np, 0, 1)
+    # Check if channels are first and transpose if necessary
+    if recovered_np.ndim == 3 and recovered_np.shape[0] == 3:
+        recovered_np = np.transpose(recovered_np, (1, 2, 0))  # [H, W, C]
+        logging.debug(f"Transposed recovered_image shape: {recovered_np.shape}")
+    elif recovered_np.ndim == 2:
+        # Single channel image, expand dims to [H, W, 1]
+        recovered_np = np.expand_dims(recovered_np, axis=2)
+        logging.debug(f"Expanded recovered_image shape: {recovered_np.shape}")
     
-    # Clip values to [0,1] for display
+    # Validate shape after processing
+    if recovered_np.ndim != 3 or recovered_np.shape[2] not in [1, 3]:
+        logging.error(f"Recovered image has invalid shape after processing: {recovered_np.shape}")
+        raise ValueError(f"Recovered image has invalid shape after processing: {recovered_np.shape}")
+    
+    # Clip values to [0,1]
     recovered_np = np.clip(recovered_np, 0, 1)
+    
+    # Process Ground Truth Image
+    ground_truth_np = ground_truth_image.detach().cpu().numpy()
+    logging.debug(f"Original ground_truth_image shape: {ground_truth_np.shape}")
+    
+    # Remove batch dimension if present
+    if ground_truth_np.ndim == 4 and ground_truth_np.shape[0] == 1:
+        ground_truth_np = ground_truth_np.squeeze(0)
+        logging.debug(f"Squeezed ground_truth_image shape: {ground_truth_np.shape}")
+    elif ground_truth_np.ndim == 3 and ground_truth_np.shape[0] == 1:
+        ground_truth_np = ground_truth_np.squeeze(0)
+        logging.debug(f"Squeezed ground_truth_image shape: {ground_truth_np.shape}")
+    
+    # Check if channels are first and transpose if necessary
+    if ground_truth_np.ndim == 3 and ground_truth_np.shape[0] == 3:
+        ground_truth_np = np.transpose(ground_truth_np, (1, 2, 0))  # [H, W, C]
+        logging.debug(f"Transposed ground_truth_image shape: {ground_truth_np.shape}")
+    elif ground_truth_np.ndim == 2:
+        # Single channel image, expand dims to [H, W, 1]
+        ground_truth_np = np.expand_dims(ground_truth_np, axis=2)
+        logging.debug(f"Expanded ground_truth_image shape: {ground_truth_np.shape}")
+    
+    # Validate shape after processing
+    if ground_truth_np.ndim != 3 or ground_truth_np.shape[2] not in [1, 3]:
+        logging.error(f"Ground truth image has invalid shape after processing: {ground_truth_np.shape}")
+        raise ValueError(f"Ground truth image has invalid shape after processing: {ground_truth_np.shape}")
+    
+    # Clip values to [0,1]
     ground_truth_np = np.clip(ground_truth_np, 0, 1)
     
-    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
-    axes[0].imshow(ground_truth_np)
+    # Initialize Closest Same-Class Image
+    closest_same_np = None
+    if closest_image_same_class is not None:
+        closest_same_np = closest_image_same_class.detach().cpu().numpy()
+        logging.debug(f"Original closest_same_np shape: {closest_same_np.shape}")
+        
+        # Remove batch dimension if present
+        if closest_same_np.ndim == 4 and closest_same_np.shape[0] == 1:
+            closest_same_np = closest_same_np.squeeze(0)
+            logging.debug(f"Squeezed closest_same_np shape: {closest_same_np.shape}")
+        elif closest_same_np.ndim == 3 and closest_same_np.shape[0] == 1:
+            closest_same_np = closest_same_np.squeeze(0)
+            logging.debug(f"Squeezed closest_same_np shape: {closest_same_np.shape}")
+        
+        # Check if channels are first and transpose if necessary
+        if closest_same_np.ndim == 3 and closest_same_np.shape[0] == 3:
+            closest_same_np = np.transpose(closest_same_np, (1, 2, 0))  # [H, W, C]
+            logging.debug(f"Transposed closest_same_np shape: {closest_same_np.shape}")
+        elif closest_same_np.ndim == 2:
+            # Single channel image, expand dims to [H, W, 1]
+            closest_same_np = np.expand_dims(closest_same_np, axis=2)
+            logging.debug(f"Expanded closest_same_np shape: {closest_same_np.shape}")
+        
+        # Validate shape after processing
+        if closest_same_np.ndim != 3 or closest_same_np.shape[2] not in [1, 3]:
+            logging.error(f"Closest same-class image has invalid shape after processing: {closest_same_np.shape}")
+            closest_same_np = None  # Set to None to handle gracefully
+        else:
+            # Clip values to [0,1]
+            closest_same_np = np.clip(closest_same_np, 0, 1)
+    
+    # Determine the number of columns based on the availability of closest_same_np
+    num_cols = 3 if closest_same_np is not None else 2
+    fig, axes = plt.subplots(1, num_cols, figsize=(10 * num_cols, 5))
+    
+    # Ground Truth Image
+    axes[0].imshow(ground_truth_np.squeeze())
     axes[0].set_title('Ground Truth')
     axes[0].axis('off')
     
-    axes[1].imshow(recovered_np)
+    # Reconstructed Image
+    axes[1].imshow(recovered_np.squeeze())
     axes[1].set_title('Reconstructed')
     axes[1].axis('off')
     
+    # Closest Same-Class Image or Placeholder
     if closest_same_np is not None:
-        axes[2].imshow(closest_same_np)
+        axes[2].imshow(closest_same_np.squeeze())
         axes[2].set_title('Closest Same Class')
     else:
-        # If no closest image is found, display a blank image or a message
-        blank_image = np.ones_like(recovered_np)
-        axes[2].imshow(blank_image)
-        axes[2].set_title('No Closest Image Found')
-    
-    axes[2].axis('off')
+        # Display a placeholder image or a message
+        if num_cols == 3:
+            blank_image = np.ones_like(recovered_np)
+            axes[2].imshow(blank_image)
+            axes[2].set_title('No Closest Image Found')
+        # If num_cols < 3, do nothing
     
     plt.tight_layout()
     
     if save_path:
         plt.savefig(save_path)
         logging.info(f"Visualization saved to '{save_path}'.")
+        plt.close()
     else:
         plt.show()
+
 
 
 def plot_metrics(loss_history, psnr_history, output_dir, round_num, target_label):
@@ -301,8 +389,6 @@ def get_supernet():
     model = OFAResNets32x32_10_26().to(DEVICE)
     model.set_active_subnet(d=0, e=0.1, w=0)  
     model = model.get_active_subnet()
-    
-    # Ensure all parameters require gradients
     for name, param in model.named_parameters():
         param.requires_grad = True
         if param.grad is not None:
@@ -311,91 +397,117 @@ def get_supernet():
     return model
 
 
-
-
 class DLM_Attack:
     """
-    Performs the DLM attack to reconstruct input data by matching gradients.
+    Performs the DLM attack to reconstruct input data by matching gradients using LBFGS optimizer.
     """
-    def __init__(self, model, loss_fn, optimizer_class, optimizer_params, target_label, ground_truth_data, device):
+    def __init__(self, model, loss_fn, optimizer_class, optimizer_params, device):
         self.model = model
         self.loss_fn = loss_fn
         self.optimizer_class = optimizer_class
         self.optimizer_params = optimizer_params
-        self.target_label = target_label
         self.device = device
-        # Initialize reconstructed data with the same shape and type as ground truth data
-        self.reconstructed_data = torch.randn_like(ground_truth_data).float().to(self.device).requires_grad_(True)
+        self.reconstructed_data = None
+        self.optimizer = None
+        self.target_label = None
+        self.ground_truth_data = None
+        self.loss_history = []
+        self.psnr_history = []
+        self.history_images = []  # For storing intermediate images if needed
     
-    def reconstruct_input(self, normalized_target_grads, ground_truth_data, num_steps=1000, lr=0.1):
-        optimizer = self.optimizer_class([self.reconstructed_data], **self.optimizer_params)
+    def set_attack_parameters(self, ground_truth_data, target_label, initial_reconstructed_data=None):
+        """
+        Initializes or updates the attack parameters.
+        
+        Args:
+            ground_truth_data (torch.Tensor): The ground truth image tensor.
+            target_label (torch.Tensor): The target label tensor.
+            initial_reconstructed_data (torch.Tensor, optional): The starting point for reconstruction.
+        """
+        self.ground_truth_data = ground_truth_data
+        self.target_label = target_label
+        
+        if initial_reconstructed_data is not None:
+            # Use the previous reconstructed data as the starting point
+            self.reconstructed_data = initial_reconstructed_data.clone().detach().to(self.device).requires_grad_(True)
+            logging.info("[*] Initialized reconstructed_data from previous reconstruction.")
+        else:
+            # Initialize randomly
+            self.reconstructed_data = torch.randn_like(ground_truth_data).float().to(self.device).requires_grad_(True)
+            logging.info("[*] Initialized reconstructed_data randomly.")
+        
+        # Initialize the optimizer with the current reconstructed_data
+        self.optimizer = self.optimizer_class([self.reconstructed_data], **self.optimizer_params)
+        logging.info("[*] Optimizer initialized.")
+        
+        # Reset history
+        self.loss_history = []
+        self.psnr_history = []
+        self.history_images = []
     
-        loss_history = []
-        psnr_history = []
-        total_loss_list = []  # Mutable container to capture total_loss
+    def reconstruct_input(self, normalized_target_grads, num_steps=1000):
+        self.model.eval()
+        self.reconstructed_data.requires_grad_(True)
     
         offset = 1e-8  # Small constant to prevent division by zero
     
-        for step in range(1, num_steps + 1):
-            def closure():
-                optimizer.zero_grad()
+        def closure():
+            self.optimizer.zero_grad()
     
-                # Forward pass with reconstructed data
-                outputs = self.model(self.reconstructed_data)
-                loss_ce = self.loss_fn(outputs, self.target_label.view(-1))
+            # Forward pass with reconstructed data
+            outputs = self.model(self.reconstructed_data)
+            loss_ce = self.loss_fn(outputs, self.target_label.view(-1))
     
-                # Compute gradients of loss_ce w.r.t. model parameters
-                grads_current = torch.autograd.grad(loss_ce, self.model.parameters(), create_graph=True)
+            # Compute gradients of loss_ce w.r.t. model parameters
+            grads_current = torch.autograd.grad(loss_ce, self.model.parameters(), create_graph=True)
     
-                # Compute gradient matching loss with normalized gradients
-                grad_diff = 0.0
-                for gx, gy in zip(grads_current, normalized_target_grads):
-                    gx_norm = gx.norm()
-                    gy_norm = gy.norm()
+            # Compute gradient matching loss with normalized gradients
+            grad_diff = 0.0
+            for gx, gy in zip(grads_current, normalized_target_grads):
+                gx_norm = gx.norm()
+                gy_norm = gy.norm()
     
-                    gx_normalized = gx / (gx_norm + offset)
-                    gy_normalized = gy / (gy_norm + offset)
+                gx_normalized = gx / (gx_norm + offset)
+                gy_normalized = gy / (gy_norm + offset)
     
-                    grad_diff += nn.functional.mse_loss(gx_normalized, gy_normalized)
+                # Sum of squared differences
+                grad_diff += ((gx_normalized - gy_normalized) ** 2).sum()
     
-                # add pixel-wise loss
-                #pixel_loss = nn.functional.mse_loss(self.reconstructed_data, ground_truth_data)
-                total_loss = grad_diff # Adjust weighting as necessary
+            # Backward on grad_diff to update reconstructed data
+            grad_diff.backward()
     
-                # Backward on total loss to update reconstructed data
-                total_loss.backward()
-    
-                # Append the loss to the list for external access
-                total_loss_list.append(total_loss.item())
-    
-                return total_loss
-    
-            # Perform optimization step
-            optimizer.step(closure)
-    
-            # Retrieve the latest total_loss from the list
-            if total_loss_list:
-                latest_loss = total_loss_list[-1]
-                loss_history.append(latest_loss)
-            else:
-                logging.warning("No loss recorded during this step.")
+            # Record the loss
+            self.loss_history.append(grad_diff.item())
     
             # Compute PSNR
-            mse = torch.mean((self.reconstructed_data - ground_truth_data) ** 2).item()
+            mse = torch.mean((self.reconstructed_data - self.ground_truth_data) ** 2).item()
             psnr = 10 * np.log10(1.0 / mse) if mse > 0 else float('inf')
-            psnr_history.append(psnr)
+            self.psnr_history.append(psnr)
     
-            # Logging every 100 steps and the first step
-            if step % 100 == 0 or step == 1:
-                logging.info(f"Step [{step}/{num_steps}], PSNR: {psnr:.2f} dB, Loss: {latest_loss:.6f}")
+            # Optionally, store intermediate images
+            self.history_images.append(self.reconstructed_data.clone().detach())
     
-            # Early stopping if total loss is sufficiently low
-            if len(loss_history) > 0 and loss_history[-1] < 1e-6:
-                logging.info(f"[*] Converged at step {step}.")
-                break
+            # Logging every certain steps
+            iters = len(self.loss_history)
+            if iters % (max(1, num_steps // 10)) == 0 or iters == 1:
+                # Compute LPIPS
+                ss_dummy_data = self.reconstructed_data.clone().detach()
+                ss_gt_data = self.ground_truth_data.clone().detach()
+                LPIPS = dis_lpips(ss_dummy_data, ss_gt_data).item()
+                logging.info(f"----------------------------------------------------")
+                logging.info(f"Iters = {iters}, Loss = {grad_diff.item():.6f}")
+                logging.info(f"PSNR = {psnr:.2f} dB")
+                logging.info(f"LPIPS = {LPIPS:.4f}")
+                logging.info(f"----------------------------------------------------")
+    
+            return grad_diff
+    
+        # Perform optimization steps
+        for step in range(1, num_steps + 1):
+            self.optimizer.step(closure)
     
         # After optimization, retrieve the reconstructed data
-        recovered_data = self.reconstructed_data.detach().cpu()
+        recovered_data = self.reconstructed_data.detach()
     
         # Compute recovered label based on model's prediction
         with torch.no_grad():
@@ -404,7 +516,7 @@ class DLM_Attack:
     
         logging.info(f"[*] Reconstruction completed. Recovered Label: {recovered_label}")
     
-        return recovered_data, recovered_label, loss_history, psnr_history
+        return recovered_data, recovered_label, self.loss_history, self.psnr_history
 
 
 def apply_weight_update(model, weight_update):
@@ -419,7 +531,7 @@ def apply_weight_update(model, weight_update):
                 logging.warning(f"Parameter '{name}' not found in weight_update.")
 
 
-def dlm_attack(pickle_path, ground_truth_dir, output_dir, num_steps=1000, lr=0.1, device=DEVICE):
+def dlm_attack(pickle_path, ground_truth_dir, output_dir, num_steps=1000, lr=1.0, device=DEVICE):
     if not os.path.isfile(pickle_path):
         logging.error(f"Pickle file not found: {pickle_path}")
         return
@@ -427,143 +539,153 @@ def dlm_attack(pickle_path, ground_truth_dir, output_dir, num_steps=1000, lr=0.1
     # Create output_dir if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
-    # Initialize the model with the specific supernet architecture
-    model = get_supernet()
-    model.eval()  # Set to eval mode
-    logging.info("[*] Initialized supernet model.")
+    # Initialize the models
+    model1 = get_supernet()
+    model1.eval()  # Set to eval mode
+    logging.info("[*] Initialized model1 (previous checkpoint).")
 
-    # Log requires_grad status
-    for name, param in model.named_parameters():
-        logging.info(f"Parameter: {name}, requires_grad: {param.requires_grad}")
+    model2 = get_supernet()
+    model2.eval()  # Set to eval mode
+    logging.info("[*] Initialized model2 (current checkpoint).")
 
     # Load weight updates
     weight_updates = load_weight_updates(pickle_path)
+    
+    if len(weight_updates) < 2:
+        logging.error("Not enough weight updates to perform DLM attack (need at least two checkpoints).")
+        return
 
     # Load ground truth images (for all labels)
     ground_truth_images_all = load_ground_truth_images(ground_truth_dir)  # Load one image per label
 
     # Initialize LPIPS loss function once
     lpips_fn = lpips.LPIPS(net='alex').to(device)
+    
+    # Alias for LPIPS function in closure
+    global dis_lpips
+    dis_lpips = lpips_fn  # Ensure LPIPS is accessible globally for the closure
 
-    # Iterate over each round and perform the attack
-    for idx, (round_num, update_path) in enumerate(weight_updates):
-        logging.info(f"[*] Processing Round {round_num} ({idx+1}/{len(weight_updates)})")
+    # Select target labels if necessary
+    target_label = 0  # Example: label 0
+    if target_label not in ground_truth_images_all:
+        logging.error(f"No ground truth image found for label {target_label} in '{ground_truth_dir}'. Exiting.")
+        return
 
-        if not os.path.exists(update_path):
-            logging.error(f"Weight update file not found at '{update_path}'. Skipping Round {round_num}.")
+    ground_truth_data = ground_truth_images_all[target_label]
+    ground_truth_label_tensor = torch.tensor([target_label], dtype=torch.long).to(device)
+
+    # Initialize the DLM_Attack object with model1 and LBFGS optimizer
+    dlm_attacker = DLM_Attack(
+        model=model1,
+        loss_fn=nn.CrossEntropyLoss(),
+        optimizer_class=optim.LBFGS,  # Switch to LBFGS
+        optimizer_params={
+            'lr': lr,
+            'history_size': 10,
+            'max_iter': 20,  # Adjust based on requirements
+            'line_search_fn': 'strong_wolfe'  # Or 'backtracking'
+        },
+        device=device
+    )
+
+    # Initialize reconstructed_data as None for the first iteration
+    previous_recovered_data = None
+
+    # Loop Range: Start from 2 to n
+    for i in range(2, len(weight_updates) + 1):
+        # Adjust indices to match the new loop range
+        round_num_prev, update_path_prev = weight_updates[i-2]
+        round_num_curr, update_path_curr = weight_updates[i-1]
+
+        logging.info(f"[*] Processing Checkpoint Pair: Round {round_num_prev} -> Round {round_num_curr}")
+
+        # Load and apply the previous checkpoint to model1
+        if not os.path.exists(update_path_prev):
+            logging.error(f"Weight update file not found at '{update_path_prev}'. Skipping Checkpoint Pair {round_num_prev} -> {round_num_curr}.")
             continue
 
-        # Load the weight update
         try:
-            with open(update_path, 'rb') as f:
-                weight_update = pickle.load(f)
-            logging.info(f"Loaded weight update for Round {round_num} from '{update_path}'.")
+            with open(update_path_prev, 'rb') as f:
+                weight_update_prev = pickle.load(f)
+            apply_weight_update(model1, weight_update_prev)
+            logging.info(f"Applied weight update for Round {round_num_prev} to model1.")
         except Exception as e:
-            logging.error(f"Error loading weight update for Round {round_num}: {e}")
+            logging.error(f"Error loading/applying weight update for Round {round_num_prev}: {e}")
             continue
 
-        # Apply the weight update to the model
+        # Load and apply the current checkpoint to model2
+        if not os.path.exists(update_path_curr):
+            logging.error(f"Weight update file not found at '{update_path_curr}'. Skipping Checkpoint Pair {round_num_prev} -> {round_num_curr}.")
+            continue
+
         try:
-            apply_weight_update(model, weight_update)
-            logging.info(f"Applied weight update for Round {round_num}.")
+            with open(update_path_curr, 'rb') as f:
+                weight_update_curr = pickle.load(f)
+            apply_weight_update(model2, weight_update_curr)
+            logging.info(f"Applied weight update for Round {round_num_curr} to model2.")
         except Exception as e:
-            logging.error(f"Error applying weight update for Round {round_num}: {e}")
-            continue  # Skip this update and proceed to the next
-
-        # For initial focus, process only class 0
-        target_label = 0
-        ground_truth_data_dict = load_ground_truth_images(ground_truth_dir, target_label=target_label)
-        
-        if target_label not in ground_truth_data_dict:
-            logging.error(f"No ground truth image found for label {target_label} in '{ground_truth_dir}'. Skipping.")
+            logging.error(f"Error loading/applying weight update for Round {round_num_curr}: {e}")
             continue
 
-        ground_truth_data = ground_truth_data_dict[target_label]
-        ground_truth_label = torch.tensor([target_label], dtype=torch.long).to(device)
+        # Compute target gradients: c_(i-1).param - c_i.param
+        target_gradients = []
+        for param1, param2 in zip(model1.parameters(), model2.parameters()):
+            grad = param1.data - param2.data 
+            target_gradients.append(grad.detach().clone())
 
-        # Initialize the DLM attack with ground_truth_data
-        dlm_attacker = DLM_Attack(
-            model=model,
-            loss_fn=nn.CrossEntropyLoss(),
-            optimizer_class=optim.LBFGS,  # Switch to LBFGS
-            optimizer_params={'lr': lr, 'max_iter': 1, 'history_size': 10, 'line_search_fn': 'strong_wolfe'},
-            target_label=ground_truth_label,
+        # Verify that target_gradients are non-zero
+        if all(torch.all(g == 0) for g in target_gradients):
+            logging.warning(f"All target gradients are zero for Checkpoint Pair {round_num_prev} -> {round_num_curr}. Skipping attack.")
+            continue
+
+        # Normalize target gradients
+        normalized_target_grads = [g / (g.norm() + 1e-8) for g in target_gradients]
+
+        # Set model1 to model1's current state
+        dlm_attacker.model = model1
+        dlm_attacker.model.eval()
+
+        # Set attack parameters inside the loop
+        dlm_attacker.set_attack_parameters(
             ground_truth_data=ground_truth_data,
-            device=device
+            target_label=ground_truth_label_tensor,
+            initial_reconstructed_data=previous_recovered_data  # Use previous reconstruction
         )
 
-        # Compute the gradients of the model with respect to the loss using ground truth data
-        model.zero_grad()
-        outputs = model(ground_truth_data)
-        loss = nn.CrossEntropyLoss()(outputs, ground_truth_label.view(-1))
-        loss.backward()
-
-        # Extract target gradients
-        target_gradients = {}
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                target_gradients[name] = param.grad.detach().clone()
-
-        # Compute dummy gradients from a dummy input
-        dummy_data = torch.randn_like(ground_truth_data).to(device).requires_grad_(True)
-        dummy_label = torch.tensor([target_label], dtype=torch.long).to(device)
-
-        # Forward pass with dummy data
-        dummy_outputs = model(dummy_data)
-        dummy_loss = nn.CrossEntropyLoss()(dummy_outputs, dummy_label.view(-1))
-
-        # Compute gradients with respect to model parameters
-        try:
-            dummy_dy_dx = torch.autograd.grad(dummy_loss, model.parameters(), create_graph=True)
-        except RuntimeError as e:
-            logging.error(f"Error computing dummy gradients: {e}")
-            continue
-
-        # Normalize gradients
-        dummy_norm = torch.stack([g.norm() for g in dummy_dy_dx]).mean()
-        target_norm = torch.stack([g.norm() for g in target_gradients.values()]).mean()
-
-        offset = 1e-8
-        if dummy_norm == 0 or target_norm == 0:
-            logging.error("Gradient norm is zero. Cannot normalize gradients.")
-            continue
-
-        normalized_dummy_grads = [g / (dummy_norm + offset) for g in dummy_dy_dx]
-        normalized_target_grads = [g / (target_norm + offset) for g in target_gradients.values()]
-
-        # Perform the DLM attack to reconstruct the input
+        # Perform the DLM attack to reconstruct the input using LBFGS
         try:
             recovered_data, recovered_label, loss_history, psnr_history = dlm_attacker.reconstruct_input(
                 normalized_target_grads=normalized_target_grads,
-                ground_truth_data=ground_truth_data,
-                num_steps=num_steps,
-                lr=lr
+                num_steps=num_steps  # Example PSNR threshold for early stopping
             )
         except Exception as e:
-            logging.error(f"Error during reconstruction in Round {round_num}: {e}")
+            logging.error(f"Error during reconstruction for Checkpoint Pair {round_num_prev} -> {round_num_curr}: {e}")
             continue
+
+        # Update previous_recovered_data for the next iteration
+        previous_recovered_data = recovered_data.clone()
 
         # Compute Metrics
         try:
-            accuracy = compute_accuracy(recovered_label, ground_truth_label.item())
+            accuracy = compute_accuracy(recovered_label, target_label)
             psnr = compute_psnr_metric(recovered_data, ground_truth_data)
             ssim_score = compute_ssim_metric(recovered_data, ground_truth_data)
             lpips_score = compute_lpips_score(recovered_data, ground_truth_data, lpips_fn)
         except Exception as e:
-            logging.error(f"Error computing metrics for Round {round_num}: {e}")
+            logging.error(f"Error computing metrics for Checkpoint Pair {round_num_prev} -> {round_num_curr}: {e}")
             accuracy = 0
             psnr = float('nan')
             ssim_score = float('nan')
             lpips_score = float('nan')
 
-        logging.info(f"Metrics for Round {round_num}, Label {target_label}:")
+        logging.info(f"Metrics for Checkpoint Pair {round_num_prev} -> {round_num_curr}, Label {target_label}:")
         logging.info(f"Accuracy: {accuracy}")
         logging.info(f"PSNR: {psnr:.2f} dB")
         logging.info(f"SSIM: {ssim_score:.4f}")
         logging.info(f"LPIPS: {lpips_score:.4f}")
 
-        # Define unique output path for this round and label
-        output_path = os.path.join(output_dir, f'recovered_round_{round_num}_label_{target_label}.pt')
+        # Define unique output path for this checkpoint pair and label
+        output_path = os.path.join(output_dir, f'recovered_round_{round_num_prev}_to_{round_num_curr}_label_{target_label}.pt')
 
         # Save Recovered Data and Metrics
         try:
@@ -579,48 +701,39 @@ def dlm_attack(pickle_path, ground_truth_dir, output_dir, num_steps=1000, lr=0.1
             }, output_path)
             logging.info(f"[*] Recovered data and metrics saved to '{output_path}'.")
         except Exception as e:
-            logging.error(f"Error saving recovered data for Round {round_num}: {e}")
+            logging.error(f"Error saving recovered data for Checkpoint Pair {round_num_prev} -> {round_num_curr}: {e}")
 
-        closest_label_same, closest_image_same, min_psnr_same = find_closest_image_same_class(
-            recovered_data,
-            ground_truth_images_all,  # Only class 0
-            compute_psnr_metric,
-            target_label=target_label
-        )
-
-        # Visualize Recovered Data and Closest Images
-        visualization_path = os.path.join(output_dir, f'visual_round_{round_num}_label_{target_label}.png')
+        # Optionally, save the reconstructed image
+        visual_path = os.path.join(output_dir, f'recovered_round_{round_num_prev}_to_{round_num_curr}_label_{target_label}.png')
         try:
+            # Find the closest same-class image for visualization
+            closest_label, closest_image, best_score = find_closest_image_same_class(
+                recovered_data,
+                ground_truth_images_all,
+                compute_psnr_metric,
+                target_label
+            )
             visualize_recovered_data(
                 recovered_data,
                 ground_truth_data,
-                closest_image_same,
-                save_path=visualization_path
+                closest_image_same_class=closest_image,  # Pass the closest image
+                save_path=visual_path
             )
+            logging.info(f"[*] Visualization saved to '{visual_path}'.")
         except Exception as e:
-            logging.error(f"Error during visualization for Round {round_num}: {e}")
+            logging.error(f"Error during visualization for Checkpoint Pair {round_num_prev} -> {round_num_curr}: {e}")
 
         # Plot and save metrics
         try:
-            plot_metrics(loss_history, psnr_history, output_dir, round_num, target_label)
+            plot_metrics(loss_history, psnr_history, output_dir, f"{round_num_prev}_to_{round_num_curr}", target_label)
         except Exception as e:
-            logging.error(f"Error plotting metrics for Round {round_num}: {e}")
+            logging.error(f"Error plotting metrics for Checkpoint Pair {round_num_prev} -> {round_num_curr}: {e}")
 
     logging.info("[*] DLM attack completed successfully.")
 
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler("dlm_attack.log")
-        ]
-    )
-    
-
-    parser = argparse.ArgumentParser(description='DLM Attack on SuperFedNAS with CIFAR-10')
+    parser = argparse.ArgumentParser(description='DLM Attack on SuperFedNAS with CIFAR-10 using LBFGS')
     
     parser.add_argument('--pickle', type=str, default='./weight_updates/model_paths.pkl',
                         help='Path to weight updates pickle file')
@@ -630,7 +743,7 @@ def main():
                         help='Directory to save recovered data and metrics')
     parser.add_argument('--steps', type=int, default=1000,
                         help='Number of optimization steps')
-    parser.add_argument('--lr', type=float, default=0.1,
+    parser.add_argument('--lr', type=float, default=1.0,  # Adjusted default LR for LBFGS
                         help='Learning rate for optimizer')
     parser.add_argument('--gpu_id', type=int, default=7,
                         help='GPU ID to use (0-7)')
@@ -641,6 +754,9 @@ def main():
     DEVICE = set_device(args.gpu_id)
     logging.info(f"Using device: {DEVICE} (GPU ID: {args.gpu_id})")
     
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
     # Perform the DLM attack
     dlm_attack(
         pickle_path=args.pickle,
@@ -650,6 +766,7 @@ def main():
         lr=args.lr,
         device=DEVICE
     )
+
 
 if __name__ == "__main__":
     main()
