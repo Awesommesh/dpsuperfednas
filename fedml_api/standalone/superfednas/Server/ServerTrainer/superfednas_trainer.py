@@ -17,6 +17,7 @@ PROXIMAL DIST LOSS NOT IMPLEMENTED
 LAYERWISE WD NOT IMPLEMENTED
 """
 
+
 # Note: note filtering non-trainable parameters
 def model_vector(model, req_grad=True):
     if not req_grad:
@@ -25,9 +26,11 @@ def model_vector(model, req_grad=True):
     param = [p.view(-1) for p in model.parameters()]
     return torch.cat(param, dim=0)
 
+
 def model_dict_to_vector(model_dict, model_copy, req_grad=True):
     model_copy.load_state_dict(model_dict)
     return model_vector(model_copy, req_grad=req_grad)
+
 
 class FLOFA_Trainer(ABC):
     def __init__(
@@ -68,6 +71,7 @@ class FLOFA_Trainer(ABC):
 
         self.all_client_weight_updates = {}
         self.all_server_model_updates = {}
+        
 
         self.args = args
         self.start_round = start_round
@@ -200,27 +204,39 @@ class FLOFA_Trainer(ABC):
             if round_idx >= self.best_model_interval:
                 self.best_model_interval += self.args.best_model_freq
                 self.prev_best = 0.0
+            self.server_model.set_active_subnet(d=0, e=0.1, w=0)
             smallest_subnet = self.server_model.get_active_subnet()
             smallest_subnet_update = {
                 'round': round_idx,
                 'weight_update': smallest_subnet.state_dict()
             }
-            server_model_update_filename = f'~/superfed/superfednas/dlm/weight_updates/server_updates/server_weight_updates_round_{round_num}.pkl'
+            server_model_update_filename = f'server_weight_updates_round_{round_idx}.pkl'
             server_checkpoint_path = os.path.join(self.server_model_updates_dir, server_model_update_filename)
-            with open(server_checkpoint_path, 'wb') as f:
-                pickle.dump(smallest_subnet_update['weight_update'], f)
-            logging.info(f"Saved weight updates for round {round_num} at {server_checkpoint_path}")
-            self.all_server_model_updates[round_idx] = server_checkpoint_path
-            #get_active_subnet() smallest subnet
-            #save server model
-            #checkpoint for each client    
+            try:
+                with open(server_checkpoint_path, 'wb') as f:
+                    pickle.dump(smallest_subnet_update['weight_update'], f)
+                logging.info(f"Saved weight updates for round {round_idx} at {server_checkpoint_path}")
+                self.all_server_model_updates[round_idx] = server_checkpoint_path
+            except Exception as e:
+                logging.error(f"Error saving server model update for round {round_idx}: {e}")
             self.train_one_round(round_idx)
-        original_path = f'~/superfed/superfednas/dlm/weight_updates/all_weight_updates.pkl'
-        expanded_path = os.path.expanduser(original_path)
-        ground_truth_dir = os.path.dirname(expanded_path)
-        os.makedirs(ground_truth_dir, exist_ok=True)
-        with open(expanded_path, 'wb') as f:
-            pickle.dump(self.all_server_model_updates, f)
+        all_server_updates_filename = 'all_server_model_updates.pkl'
+        all_server_updates_path = os.path.join(self.server_model_updates_dir, all_server_updates_filename)
+        try:
+            with open(all_server_updates_path, 'wb') as f:
+                pickle.dump(self.all_server_model_updates, f)
+            logging.info(f"Saved all server model updates at {all_server_updates_path}")
+        except Exception as e:
+            logging.error(f"Error saving all server model updates: {e}")       
+
+        all_client_updates_filename = 'all_client_model_updates.pkl'
+        all_client_updates_path = os.path.join(self.client_weight_updates_dir, all_client_updates_filename)
+        try:
+            with open(all_client_updates_path, 'wb') as f:
+                pickle.dump(self.all_client_model_updates, f)
+            logging.info(f"Saved all client weight updates at {all_client_updates_path}") 
+        except Exception as e:
+            logging.erorr(f"Error saving all client weight updates: {e}")
         if self.args.dry_run:
             return
         if self.args.wandb_watch:
@@ -241,7 +257,6 @@ class FLOFA_Trainer(ABC):
         avg_gflops = 0
         avg_params = 0
         training_samples = []
-        self.weight_update = []
         for idx in range(self.args.client_num_per_round):
             # update dataset
             client_idx = client_indexes[idx]
@@ -313,10 +328,6 @@ class FLOFA_Trainer(ABC):
                 'round': round_num,
                 'weight_update': updated_cli_model.state_dict()
             }
-            original_data, original_label = self.client_trainer.local_training_data, self.client_trainer.local_test_data
-            self.save_ground_truth(original_data, original_label, round_num, client_idx)
-            self.weight_update.append(client_update)
-            self.all_weight_updates.append(client_update)
             training_samples.append(self.client_trainer.get_sample_number())
             # Update client state
             if self.feddyn:
@@ -417,15 +428,17 @@ class FLOFA_Trainer(ABC):
                 self.args.ofa_config,
                 self.args.model,
             )
-
-        if client_update['is_smallest'] and client_update['client_id'] == 0:
+        if client_update['client_id'] == 0:
             checkpoint_filename = f"weight_updates_round_{round_num}.pkl"
-            checkpoint_path = os.path.join(self.weight_updates_dir, checkpoint_filename)
-            with open(checkpoint_path, 'wb') as f:
-                pickle.dump(client_update['weight_update'], f)
-            logging.info(f"Saved weight updates for round {round_num} at {checkpoint_path}")
+            checkpoint_path = os.path.join(self.client_weight_updates_dir, checkpoint_filename)
+            try:
+                with open(checkpoint_path, 'wb') as f:
+                    pickle.dump(client_update['weight_update'], f)
+                logging.info(f"Saved weight updates for round {round_num} at {checkpoint_path}")
+                self.all_client_weight_updates[round_num] = checkpoint_path
+            except Exception as e:
+                logging.error(f"Error saving client weight updates for round {round_num}: {e}")
 
-            self.client_weight_updates[round_num] = checkpoint_path
 
     def _local_test_on_all_clients(self, round_idx):
 
@@ -1138,24 +1151,5 @@ class FLOFA_Trainer(ABC):
             self.server_model.get_server_state().parameters(), model_delta.parameters(),
         ):
             state_param.data -= self.feddyn_alpha * delta_param
-
-    def save_ground_truth(self, data, label, round_num, client_id):
-        """
-        Save the ground truth data and label to a .pt file.
-        
-        Args:
-            data (torch.Tensor): Image tensor of shape [1, 3, 32, 32].
-            label (int): Integer label corresponding to the image.
-            round_num (int): Current round number.
-            client_id (int): Identifier of the client.
-        """
-        original_path = f'~/superfed/superfednas/dlm/ground_truths/ground_truth_round_{round_num}_client_{client_id}.pkl'
-        expanded_path = os.path.expanduser(original_path)        
-        ground_truth_dir = os.path.dirname(expanded_path)
-        os.makedirs(ground_truth_dir, exist_ok=True)
-        
-        torch.save({'data': data, 'label': label}, expanded_path)
-        logging.info(f"Saved ground truth to '{expanded_path}'.")
-
 
 
