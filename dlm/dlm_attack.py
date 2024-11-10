@@ -541,8 +541,8 @@ def dlm_attack(client_pickle_path, server_pickle_path, ground_truth_dir, output_
     previous_recovered_data = None
     num_iterations = 20
     for i in range(num_iterations):
-        for i in range(2, len(client_weight_updates)):
-            round_num_prev, update_path_prev = server_weight_updates[i-1]
+        for i in range(0, len(client_weight_updates)):
+            round_num_prev, update_path_prev = server_weight_updates[i]
             round_num_curr, update_path_curr = client_weight_updates[i]
 
             logging.info(f"[*] Processing Checkpoint Pair: Round {round_num_prev} -> Round {round_num_curr}")
